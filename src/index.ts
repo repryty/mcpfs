@@ -1554,9 +1554,12 @@ app.get("/authorize", async (req: Request, res: Response) => {
 </body>
 </html>`;
 
+  // Browsers apply form-action to the redirect that follows a form POST, so the
+  // registered redirect URI's origin must be allowed or Allow/Deny silently does nothing.
+  const redirectOrigin = new URL(redirect_uri).origin;
   res.setHeader(
     "Content-Security-Policy",
-    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+    `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${redirectOrigin}; base-uri 'none'; frame-ancestors 'none'`
   );
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.type("html").send(html);
