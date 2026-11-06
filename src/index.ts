@@ -27,8 +27,12 @@ import {
   applyFileEdits,
   tailFile,
   headFile,
-  setAllowedDirectories,
+  setVaultRoot,
+  toVaultPath,
+  withVaultErrors,
+  VAULT_PATH_NOTE,
 } from "./lib.js";
+import { loadPolishConfig, registerPolishTools } from "./polish.js";
 
 // Get the directory where this script is located
 const __filename = fileURLToPath(import.meta.url);
@@ -521,61 +525,52 @@ function isUnsafePath(dirPath: string): boolean {
 // Command line argument parsing - filter out flags
 const args = process.argv.slice(2).filter((arg) => !arg.startsWith("--"));
 
-// If no directories provided, try to use current directory if safe
+if (args.length > 1) {
+  logger.error("Only a single vault directory can be served.");
+  logger.info("Usage: mcpfs [vault-directory]");
+  process.exit(1);
+}
+
+// If no directory provided, try to use current directory if safe
+const requestedVault = args[0] ?? process.cwd();
 if (args.length === 0) {
-  const cwd = process.cwd();
-  if (isUnsafePath(cwd)) {
-    logger.error("No directories specified and current directory is unsafe to serve.");
-    logger.error(`Current directory: ${cwd}`);
-    logger.info("Usage: mcpfs [allowed-directory] [additional-directories...]");
+  if (isUnsafePath(requestedVault)) {
+    logger.error("No vault directory specified and current directory is unsafe to serve.");
+    logger.error(`Current directory: ${requestedVault}`);
+    logger.info("Usage: mcpfs [vault-directory]");
     logger.info("For safety, the server won't automatically serve:");
     logger.info("  - Root directory (/)");
     logger.info("  - Home directory (~)");
     logger.info("  - System directories (/usr, /etc, /var, etc.)");
-    logger.info("Please specify allowed directories explicitly, or run from a project directory.");
+    logger.info("Please specify the vault directory explicitly, or run from inside it.");
     process.exit(1);
-  } else {
-    args.push(cwd);
-    logger.info(`No directories specified. Serving current directory: ${cwd}`);
   }
+  logger.info(`No vault directory specified. Serving current directory: ${requestedVault}`);
 }
 
-// Store allowed directories in normalized and resolved form
-const allowedDirectories = await Promise.all(
-  args.map(async (dir) => {
-    const expanded = expandHome(dir);
-    const absolute = path.resolve(expanded);
-    try {
-      // Security: Resolve symlinks in allowed directories during startup
-      // This ensures we know the real paths and can validate against them later
-      const resolved = await fs.realpath(absolute);
-      return normalizePath(resolved);
-    } catch {
-      // If we can't resolve (doesn't exist), use the normalized absolute path
-      // This allows configuring allowed dirs that will be created later
-      return normalizePath(absolute);
-    }
-  })
-);
-
-// Validate that all directories exist and are accessible
-await Promise.all(
-  allowedDirectories.map(async (dir) => {
-    try {
-      const stats = await fs.stat(dir);
-      if (!stats.isDirectory()) {
-        logger.error(`Error: ${dir} is not a directory`);
-        process.exit(1);
-      }
-    } catch (err) {
-      logger.error(`Error accessing directory ${dir}`, err);
+// Security: Resolve symlinks in the vault path during startup so later
+// validation compares against the real location.
+const vaultRoot = await (async () => {
+  const absolute = path.resolve(expandHome(requestedVault));
+  try {
+    const resolved = normalizePath(await fs.realpath(absolute));
+    const stats = await fs.stat(resolved);
+    if (!stats.isDirectory()) {
+      logger.error(`Error: ${resolved} is not a directory`);
       process.exit(1);
     }
-  })
-);
+    return resolved;
+  } catch (err) {
+    logger.error(`Error accessing vault directory ${absolute}`, err);
+    process.exit(1);
+  }
+})();
 
-// Initialize the global allowedDirectories in lib.ts
-setAllowedDirectories(allowedDirectories);
+// Initialize the vault root in lib.ts
+setVaultRoot(vaultRoot);
+
+// Optional OpenRouter-backed polishing tools (enabled when OPENROUTER_API_KEY is set)
+const polishConfig = loadPolishConfig(process.env);
 
 // Type definitions for tool arguments (with undefined to satisfy exactOptionalPropertyTypes)
 type ReadTextFileArgs = {
@@ -663,7 +658,7 @@ function createServer() {
 
   // Tool registrations
 
-  const readTextFileHandler = async (args: ReadTextFileArgs) => {
+  const readTextFileHandler = withVaultErrors(async (args: ReadTextFileArgs) => {
     const validPath = await validatePath(args.path);
 
     if (args.head && args.tail) {
@@ -683,7 +678,7 @@ function createServer() {
       content: [{ type: "text" as const, text: content }],
       structuredContent: { content },
     };
-  };
+  });
 
   // read_file is retained as a compatibility alias for older MCP clients.
   server.registerTool(
@@ -720,7 +715,7 @@ function createServer() {
         "the contents of a single file. Use the 'head' parameter to read only " +
         "the first N lines of a file, or the 'tail' parameter to read only " +
         "the last N lines of a file. Operates on the file as text regardless of extension. " +
-        "Only works within allowed directories.",
+        VAULT_PATH_NOTE,
       inputSchema: {
         path: z.string(),
         tail: z
@@ -744,7 +739,7 @@ function createServer() {
       title: "Read Media File",
       description:
         "Read an image or audio file. Returns the base64 encoded data and MIME type. " +
-        "Only works within allowed directories.",
+        VAULT_PATH_NOTE,
       inputSchema: {
         path: z.string(),
       },
@@ -759,7 +754,7 @@ function createServer() {
       },
       annotations: { readOnlyHint: true },
     },
-    async (args: ReadMediaFileArgs) => {
+    withVaultErrors(async (args: ReadMediaFileArgs) => {
       const validPath = await validatePath(args.path);
       const extension = path.extname(validPath).toLowerCase();
       const mimeTypes: Record<string, string> = {
@@ -789,7 +784,7 @@ function createServer() {
         content: [contentItem],
         structuredContent: { content: [contentItem] },
       } as unknown as CallToolResult;
-    }
+    })
   );
 
   server.registerTool(
@@ -801,19 +796,18 @@ function createServer() {
         "efficient than reading files one by one when you need to analyze " +
         "or compare multiple files. Each file's content is returned with its " +
         "path as a reference. Failed reads for individual files won't stop " +
-        "the entire operation. Only works within allowed directories.",
+        "the entire operation. " +
+        VAULT_PATH_NOTE,
       inputSchema: {
         paths: z
           .array(z.string())
           .min(1)
-          .describe(
-            "Array of file paths to read. Each path must be a string pointing to a valid file within allowed directories."
-          ),
+          .describe("Array of vault paths to read, relative to the vault root '/'."),
       },
       outputSchema: { content: z.string() },
       annotations: { readOnlyHint: true },
     },
-    async (args: ReadMultipleFilesArgs) => {
+    withVaultErrors(async (args: ReadMultipleFilesArgs) => {
       const results = await Promise.all(
         args.paths.map(async (filePath: string) => {
           try {
@@ -831,7 +825,7 @@ function createServer() {
         content: [{ type: "text" as const, text }],
         structuredContent: { content: text },
       };
-    }
+    })
   );
 
   server.registerTool(
@@ -841,7 +835,8 @@ function createServer() {
       description:
         "Create a new file or completely overwrite an existing file with new content. " +
         "Use with caution as it will overwrite existing files without warning. " +
-        "Handles text content with proper encoding. Only works within allowed directories.",
+        "Handles text content with proper encoding. " +
+        VAULT_PATH_NOTE,
       inputSchema: {
         path: z.string(),
         content: z.string(),
@@ -849,7 +844,7 @@ function createServer() {
       outputSchema: { content: z.string() },
       annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: true },
     },
-    async (args: WriteFileArgs) => {
+    withVaultErrors(async (args: WriteFileArgs) => {
       const validPath = await validatePath(args.path);
       await writeFileContent(validPath, args.content);
       const text = `Successfully wrote to ${args.path}`;
@@ -857,7 +852,7 @@ function createServer() {
         content: [{ type: "text" as const, text }],
         structuredContent: { content: text },
       };
-    }
+    })
   );
 
   server.registerTool(
@@ -867,7 +862,7 @@ function createServer() {
       description:
         "Make line-based edits to a text file. Each edit replaces exact line sequences " +
         "with new content. Returns a git-style diff showing the changes made. " +
-        "Only works within allowed directories.",
+        VAULT_PATH_NOTE,
       inputSchema: {
         path: z.string(),
         edits: z.array(
@@ -881,7 +876,7 @@ function createServer() {
       outputSchema: { content: z.string() },
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true },
     },
-    async (args: EditFileArgs) => {
+    withVaultErrors(async (args: EditFileArgs) => {
       const validPath = await validatePath(args.path);
       if (args.dryRun) {
         const result = await applyFileEdits(validPath, args.edits, true);
@@ -895,7 +890,7 @@ function createServer() {
         content: [{ type: "text" as const, text: result }],
         structuredContent: { content: result },
       };
-    }
+    })
   );
 
   server.registerTool(
@@ -906,14 +901,15 @@ function createServer() {
         "Create a new directory or ensure a directory exists. Can create multiple " +
         "nested directories in one operation. If the directory already exists, " +
         "this operation will succeed silently. Perfect for setting up directory " +
-        "structures for projects or ensuring required paths exist. Only works within allowed directories.",
+        "structures for projects or ensuring required paths exist. " +
+        VAULT_PATH_NOTE,
       inputSchema: {
         path: z.string(),
       },
       outputSchema: { content: z.string() },
       annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false },
     },
-    async (args: CreateDirectoryArgs) => {
+    withVaultErrors(async (args: CreateDirectoryArgs) => {
       const validPath = await validatePath(args.path);
       await fs.mkdir(validPath, { recursive: true });
       const text = `Successfully created directory ${args.path}`;
@@ -921,7 +917,7 @@ function createServer() {
         content: [{ type: "text" as const, text }],
         structuredContent: { content: text },
       };
-    }
+    })
   );
 
   server.registerTool(
@@ -932,14 +928,15 @@ function createServer() {
         "Get a detailed listing of all files and directories in a specified path. " +
         "Results clearly distinguish between files and directories with [FILE] and [DIR] " +
         "prefixes. This tool is essential for understanding directory structure and " +
-        "finding specific files within a directory. Only works within allowed directories.",
+        "finding specific files within a directory. " +
+        VAULT_PATH_NOTE,
       inputSchema: {
         path: z.string(),
       },
       outputSchema: { content: z.string() },
       annotations: { readOnlyHint: true },
     },
-    async (args: ListDirectoryArgs) => {
+    withVaultErrors(async (args: ListDirectoryArgs) => {
       const validPath = await validatePath(args.path);
       const entries = await fs.readdir(validPath, { withFileTypes: true });
       const formatted = entries
@@ -949,7 +946,7 @@ function createServer() {
         content: [{ type: "text" as const, text: formatted }],
         structuredContent: { content: formatted },
       };
-    }
+    })
   );
 
   server.registerTool(
@@ -960,7 +957,8 @@ function createServer() {
         "Get a detailed listing of all files and directories in a specified path, including sizes. " +
         "Results clearly distinguish between files and directories with [FILE] and [DIR] " +
         "prefixes. This tool is useful for understanding directory structure and " +
-        "finding specific files within a directory. Only works within allowed directories.",
+        "finding specific files within a directory. " +
+        VAULT_PATH_NOTE,
       inputSchema: {
         path: z.string(),
         sortBy: z
@@ -972,7 +970,7 @@ function createServer() {
       outputSchema: { content: z.string() },
       annotations: { readOnlyHint: true },
     },
-    async (args: ListDirectoryWithSizesArgs) => {
+    withVaultErrors(async (args: ListDirectoryWithSizesArgs) => {
       const validPath = await validatePath(args.path);
       const entries = await fs.readdir(validPath, { withFileTypes: true });
 
@@ -1036,7 +1034,7 @@ function createServer() {
         content: [contentBlock],
         structuredContent: { content: text },
       };
-    }
+    })
   );
 
   server.registerTool(
@@ -1047,7 +1045,8 @@ function createServer() {
         "Get a recursive tree view of files and directories as a JSON structure. " +
         "Each entry includes 'name', 'type' (file/directory), and 'children' for directories. " +
         "Files have no children array, while directories always have a children array (which may be empty). " +
-        "The output is formatted with 2-space indentation for readability. Only works within allowed directories.",
+        "The output is formatted with 2-space indentation for readability. " +
+        VAULT_PATH_NOTE,
       inputSchema: {
         path: z.string(),
         excludePatterns: z.array(z.string()).optional().default([]),
@@ -1055,7 +1054,7 @@ function createServer() {
       outputSchema: { content: z.string() },
       annotations: { readOnlyHint: true },
     },
-    async (args: DirectoryTreeArgs) => {
+    withVaultErrors(async (args: DirectoryTreeArgs) => {
       type TreeEntry = {
         name: string;
         type: "file" | "directory";
@@ -1110,7 +1109,7 @@ function createServer() {
         content: [contentBlock],
         structuredContent: { content: text },
       };
-    }
+    })
   );
 
   server.registerTool(
@@ -1118,7 +1117,8 @@ function createServer() {
     {
       title: "Move File",
       description:
-        "Move or rename files and directories. Both source and destination must be within allowed directories.",
+        "Move or rename files and directories. Both source and destination must be within the vault. " +
+        VAULT_PATH_NOTE,
       inputSchema: {
         source: z.string(),
         destination: z.string(),
@@ -1126,7 +1126,7 @@ function createServer() {
       outputSchema: { content: z.string() },
       annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: false },
     },
-    async (args: MoveFileArgs) => {
+    withVaultErrors(async (args: MoveFileArgs) => {
       const validSourcePath = await validatePath(args.source);
       const validDestPath = await validatePath(args.destination);
       await fs.rename(validSourcePath, validDestPath);
@@ -1135,7 +1135,7 @@ function createServer() {
         content: [{ type: "text" as const, text }],
         structuredContent: { content: text },
       };
-    }
+    })
   );
 
   server.registerTool(
@@ -1144,10 +1144,10 @@ function createServer() {
       title: "Search Files",
       description:
         "Recursively search for files and directories matching a pattern. " +
-        "The patterns should be glob-style patterns that match paths relative to the working directory. " +
+        "The patterns should be glob-style patterns that match paths relative to the search path. " +
         "Use pattern like '*.ext' to match files in current directory, and '**/*.ext' to match files in all subdirectories. " +
-        "Returns full paths to all matching items. Great for finding files when you don't know their exact location. " +
-        "Only searches within allowed directories.",
+        "Returns vault paths of all matching items. Great for finding files when you don't know their exact location. " +
+        VAULT_PATH_NOTE,
       inputSchema: {
         path: z.string(),
         pattern: z.string(),
@@ -1156,17 +1156,17 @@ function createServer() {
       outputSchema: { content: z.string() },
       annotations: { readOnlyHint: true },
     },
-    async (args: SearchFilesArgs) => {
+    withVaultErrors(async (args: SearchFilesArgs) => {
       const validPath = await validatePath(args.path);
-      const results = await searchFilesWithValidation(validPath, args.pattern, allowedDirectories, {
+      const results = await searchFilesWithValidation(validPath, args.pattern, {
         excludePatterns: args.excludePatterns,
       });
-      const text = results.length > 0 ? results.join("\n") : "No matches found";
+      const text = results.length > 0 ? results.map(toVaultPath).join("\n") : "No matches found";
       return {
         content: [{ type: "text" as const, text }],
         structuredContent: { content: text },
       };
-    }
+    })
   );
 
   server.registerTool(
@@ -1177,14 +1177,15 @@ function createServer() {
         "Retrieve detailed metadata about a file or directory. Returns comprehensive " +
         "information including size, creation time, last modified time, permissions, " +
         "and type. This tool is perfect for understanding file characteristics " +
-        "without reading the actual content. Only works within allowed directories.",
+        "without reading the actual content. " +
+        VAULT_PATH_NOTE,
       inputSchema: {
         path: z.string(),
       },
       outputSchema: { content: z.string() },
       annotations: { readOnlyHint: true },
     },
-    async (args: GetFileInfoArgs) => {
+    withVaultErrors(async (args: GetFileInfoArgs) => {
       const validPath = await validatePath(args.path);
       const info = await getFileStats(validPath);
       const text = Object.entries(info)
@@ -1194,7 +1195,7 @@ function createServer() {
         content: [{ type: "text" as const, text }],
         structuredContent: { content: text },
       };
-    }
+    })
   );
 
   server.registerTool(
@@ -1202,36 +1203,29 @@ function createServer() {
     {
       title: "List Allowed Directories",
       description:
-        "Returns the list of directories that this server is allowed to access. " +
-        "Subdirectories within these allowed directories are also accessible. " +
-        "Use this to understand which directories and their nested paths are available " +
-        "before trying to access files.",
+        "Returns the directory this server can access. The server exposes a single " +
+        "vault whose root is '/'; every file and subdirectory in it is accessible. " +
+        VAULT_PATH_NOTE,
       inputSchema: {},
       outputSchema: { content: z.string() },
       annotations: { readOnlyHint: true },
     },
-    async () => {
-      const text = `Allowed directories:\n${allowedDirectories.join("\n")}`;
+    withVaultErrors(async () => {
+      const text = "Allowed directories:\n/";
       return {
         content: [{ type: "text" as const, text }],
         structuredContent: { content: text },
       };
-    }
+    })
   );
 
   // MCP Roots are intentionally ignored. The server exposes only the
-  // operator-selected synchronized directory passed at startup.
-  /*
-      if (allowedDirectories.length > 0) {
-        logger.info(
-          `Client does not support MCP Roots, using allowed directories set from server args: ${allowedDirectories.join(", ")}`
-        );
-      } else {
-        throw new Error(
-          `Server cannot operate: No allowed directories available. Server was started without command-line directories and client either does not support MCP roots protocol or provided empty roots. Please either: 1) Start server with directory arguments, or 2) Use a client that supports MCP roots protocol and provides valid root directories.`
-        );
-      }
-    */
+  // operator-selected vault directory passed at startup.
+
+  if (polishConfig) {
+    registerPolishTools(server, polishConfig);
+  }
+
   return server;
 }
 
@@ -1402,9 +1396,7 @@ app.get("/authorize", async (req: Request, res: Response) => {
 
   // Show consent screen
   const clientName = escapeHtml(client.clientName || client_id);
-  const escapedDirectories = escapeHtml(
-    allowedDirectories.join(", ") || "Configured by MCP client"
-  );
+  const escapedDirectories = escapeHtml(vaultRoot);
   const html = `
 <!DOCTYPE html>
 <html>
@@ -2002,13 +1994,7 @@ app.delete("/mcp", authMiddleware, async (req: Request, res: Response) => {
 const PORT = process.env.PORT || 24024;
 const httpServer = app.listen(PORT, () => {
   logger.info(`MCP Filesystem Server (HTTP Streaming) listening on port ${PORT}`);
-  if (allowedDirectories.length === 0) {
-    logger.info(
-      "Started without allowed directories - waiting for client to provide roots via MCP protocol"
-    );
-  } else {
-    logger.info(`Allowed directories: ${allowedDirectories.join(", ")}`);
-  }
+  logger.info(`Vault root: ${vaultRoot}`);
 });
 
 // Handle server errors

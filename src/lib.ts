@@ -3,20 +3,90 @@ import path from "path";
 import { randomBytes } from "crypto";
 import { createTwoFilesPatch } from "diff";
 import { minimatch } from "minimatch";
-import { normalizePath, expandHome } from "./path-utils.js";
+import { normalizePath } from "./path-utils.js";
 import { isPathWithinAllowedDirectories } from "./path-validation.js";
 
-// Global allowed directories - set by the main module
-let allowedDirectories: string[] = [];
+// The single vault directory exposed by this server. Every tool path is
+// interpreted relative to this directory, which clients see as "/".
+let vaultRoot = "";
 
-// Function to set allowed directories from the main module
-export function setAllowedDirectories(directories: string[]): void {
-  allowedDirectories = [...directories];
+// Set the vault root (an absolute, symlink-resolved directory path)
+export function setVaultRoot(directory: string): void {
+  vaultRoot = directory;
 }
 
-// Function to get current allowed directories
-export function getAllowedDirectories(): string[] {
-  return [...allowedDirectories];
+// Get the absolute vault root
+export function getVaultRoot(): string {
+  return vaultRoot;
+}
+
+/**
+ * Maps a client-supplied vault path to an absolute filesystem path.
+ *
+ * "/", "", "." are the vault root. "notes/a.md", "/notes/a.md" and
+ * "./notes/a.md" all address the same file. For backward compatibility, an
+ * absolute path that already points inside the vault is accepted as-is.
+ * The result is not yet access-checked; use validatePath for that.
+ */
+export function resolveVaultPath(requestedPath: string): string {
+  if (!vaultRoot) {
+    throw new Error("Vault root is not configured");
+  }
+  const trimmed = requestedPath.trim();
+  if (path.isAbsolute(trimmed)) {
+    const legacyAbsolute = normalizePath(path.resolve(trimmed));
+    if (isPathWithinAllowedDirectories(legacyAbsolute, [vaultRoot])) {
+      return legacyAbsolute;
+    }
+  }
+  const relative = trimmed.replace(/^[/\\]+/, "");
+  return path.resolve(vaultRoot, relative);
+}
+
+/**
+ * Converts an absolute filesystem path inside the vault to its vault path
+ * ("/" for the root, "/notes/a.md" for a file). Paths outside the vault are
+ * returned unchanged.
+ */
+export function toVaultPath(absolutePath: string): string {
+  if (!vaultRoot) return absolutePath;
+  const relative = path.relative(vaultRoot, absolutePath);
+  if (relative === "") return "/";
+  if (relative.startsWith("..") || path.isAbsolute(relative)) return absolutePath;
+  return "/" + relative.split(path.sep).join("/");
+}
+
+/**
+ * Replaces absolute vault-root prefixes in a message (e.g. fs error text)
+ * with vault paths so the host filesystem layout is not exposed.
+ */
+export function maskVaultRoot(message: string): string {
+  if (!vaultRoot) return message;
+  return message
+    .split(vaultRoot + path.sep)
+    .join("/")
+    .split(vaultRoot)
+    .join("/");
+}
+
+// All tool paths are relative to the vault root, which clients see as "/".
+export const VAULT_PATH_NOTE =
+  "Paths are relative to the vault root, which is '/'. " +
+  "For example 'notes/today.md' and '/notes/today.md' are the same file.";
+
+// Wraps a tool handler so that error messages never expose the absolute
+// location of the vault on the host.
+export function withVaultErrors<A extends unknown[], R>(
+  handler: (...handlerArgs: A) => Promise<R>
+): (...handlerArgs: A) => Promise<R> {
+  return async (...handlerArgs: A) => {
+    try {
+      return await handler(...handlerArgs);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(maskVaultRoot(message));
+    }
+  };
 }
 
 // Type definitions
@@ -77,30 +147,23 @@ export function createUnifiedDiff(
 
 // Security & Validation Functions
 export async function validatePath(requestedPath: string): Promise<string> {
-  const expandedPath = expandHome(requestedPath);
-  const absolute = path.isAbsolute(expandedPath)
-    ? path.resolve(expandedPath)
-    : path.resolve(process.cwd(), expandedPath);
+  if (requestedPath.includes("\x00")) {
+    throw new Error("Access denied - path contains a null byte");
+  }
+  const absolute = resolveVaultPath(requestedPath);
+  const allowed = [vaultRoot];
 
-  const normalizedRequested = normalizePath(absolute);
-
-  // Security: Check if path is within allowed directories before any file operations
-  const isAllowed = isPathWithinAllowedDirectories(normalizedRequested, allowedDirectories);
-  if (!isAllowed) {
-    throw new Error(
-      `Access denied - path outside allowed directories: ${absolute} not in ${allowedDirectories.join(", ")}`
-    );
+  // Security: Check if path is within the vault before any file operations
+  if (!isPathWithinAllowedDirectories(normalizePath(absolute), allowed)) {
+    throw new Error(`Access denied - path outside the vault: ${requestedPath}`);
   }
 
   // Security: Handle symlinks by checking their real path to prevent symlink attacks
-  // This prevents attackers from creating symlinks that point outside allowed directories
+  // This prevents attackers from creating symlinks that point outside the vault
   try {
     const realPath = await fs.realpath(absolute);
-    const normalizedReal = normalizePath(realPath);
-    if (!isPathWithinAllowedDirectories(normalizedReal, allowedDirectories)) {
-      throw new Error(
-        `Access denied - symlink target outside allowed directories: ${realPath} not in ${allowedDirectories.join(", ")}`
-      );
+    if (!isPathWithinAllowedDirectories(normalizePath(realPath), allowed)) {
+      throw new Error(`Access denied - symlink target outside the vault: ${requestedPath}`);
     }
     return realPath;
   } catch (error) {
@@ -110,15 +173,14 @@ export async function validatePath(requestedPath: string): Promise<string> {
       const parentDir = path.dirname(absolute);
       try {
         const realParentPath = await fs.realpath(parentDir);
-        const normalizedParent = normalizePath(realParentPath);
-        if (!isPathWithinAllowedDirectories(normalizedParent, allowedDirectories)) {
+        if (!isPathWithinAllowedDirectories(normalizePath(realParentPath), allowed)) {
           throw new Error(
-            `Access denied - parent directory outside allowed directories: ${realParentPath} not in ${allowedDirectories.join(", ")}`
+            `Access denied - parent directory outside the vault: ${toVaultPath(parentDir)}`
           );
         }
         return absolute;
       } catch {
-        throw new Error(`Parent directory does not exist: ${parentDir}`);
+        throw new Error(`Parent directory does not exist: ${toVaultPath(parentDir)}`);
       }
     }
     throw error;
@@ -244,7 +306,7 @@ export async function applyFileEdits(
   }
 
   // Create unified diff
-  const diff = createUnifiedDiff(content, modifiedContent, filePath);
+  const diff = createUnifiedDiff(content, modifiedContent, toVaultPath(filePath));
 
   // Format diff with appropriate number of backticks
   let numBackticks = 3;
@@ -370,7 +432,6 @@ export async function headFile(filePath: string, numLines: number): Promise<stri
 export async function searchFilesWithValidation(
   rootPath: string,
   pattern: string,
-  _allowedDirectories: string[],
   options: SearchOptions = {}
 ): Promise<string[]> {
   const { excludePatterns = [] } = options;

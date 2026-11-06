@@ -36,7 +36,7 @@ call a synchronization API or require a particular synchronization backend.
 - Move files and directories
 - Search files
 - Get file metadata
-- Fixed directory access: only the configured synchronized vault is exposed
+- Single vault root: only the configured vault is exposed, and clients address it as `/`
 - **OAuth 2.1 authentication** with PKCE support
 - **ChatGPT integration** via MCP connectors
 - Works with native Syncthing services and other filesystem synchronizers
@@ -143,7 +143,7 @@ server will refuse to auto-serve:
 - Home directory (`~`)
 - System directories (`/usr`, `/etc`, `/var`, `/System`, etc.)
 
-To serve these directories, you must specify them explicitly as command-line arguments.
+To serve these directories, you must specify them explicitly as the command-line argument.
 
 ### Command Line Options
 
@@ -161,12 +161,19 @@ MCP_AUTH_SECRET=my-owner-secret mcpfs /path/to/dir
 PORT=8080 MCP_AUTH_SECRET=my-owner-secret mcpfs /path/to/dir
 ```
 
-| Variable           | Required          | Default | Description                                        |
-| ------------------ | ----------------- | ------- | -------------------------------------------------- |
-| `MCP_AUTH_SECRET`  | Yes               | -       | Private secret required on the OAuth consent page  |
-| `PORT`             | No                | 24024   | Server port                                        |
-| `MCP_PUBLIC_URL`   | Proxy deployments | -       | Canonical public origin used in OAuth metadata     |
-| `OAUTH_STATE_PATH` | No                | -       | JSON file used to persist OAuth clients and tokens |
+| Variable                  | Required          | Default    | Description                                                    |
+| ------------------------- | ----------------- | ---------- | -------------------------------------------------------------- |
+| `MCP_AUTH_SECRET`         | Yes               | -          | Private secret required on the OAuth consent page              |
+| `PORT`                    | No                | 24024      | Server port                                                    |
+| `MCP_PUBLIC_URL`          | Proxy deployments | -          | Canonical public origin used in OAuth metadata                 |
+| `OAUTH_STATE_PATH`        | No                | -          | JSON file used to persist OAuth clients and tokens             |
+| `OPENROUTER_API_KEY`      | No                | -          | Enables the polishing tools (OpenRouter API key)               |
+| `OPENROUTER_SERVICE_TIER` | No                | -          | OpenRouter service tier, e.g. `flex` (cheaper, lower priority) |
+| `OPENROUTER_MODEL`        | With API key      | -          | OpenRouter model ID, e.g. `google/<model>`                     |
+| `POLISH_TEMPLATE_DIR`     | No                | `/_polish` | Vault folder that holds polish templates                       |
+| `POLISH_TEMPERATURE`      | No                | 0.3        | Default sampling temperature for polishing                     |
+| `POLISH_MAX_CHUNK_CHARS`  | No                | 6000       | Approximate characters sent per model request                  |
+| `POLISH_TIMEOUT_MS`       | No                | 120000     | Timeout per model request                                      |
 
 Back up the synchronized directory independently of mcpfs (for example with
 Restic or filesystem snapshots). A backup job must cover changes received by
@@ -228,6 +235,10 @@ services:
       MCP_PUBLIC_URL: ${MCPFS_PUBLIC_URL:?Set MCPFS_PUBLIC_URL externally}
       OAUTH_STATE_PATH: /var/lib/mcpfs/oauth-state.json
       PORT: "24024"
+      # Optional: enables polish_file / polish_text
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}
+      OPENROUTER_SERVICE_TIER: ${OPENROUTER_SERVICE_TIER:-}
     volumes:
       - ./mcpfs/oauth:/var/lib/mcpfs:rw
       - ${OBSIDIAN_VAULT_PATH:?Set OBSIDIAN_VAULT_PATH}:/srv/obsidian/vault:rw
@@ -313,11 +324,28 @@ curl -X POST http://localhost:24024/mcp \
 The server uses a fixed directory access control system for the synchronized
 vault.
 
-### Method 1: Command-line Arguments
+### Single Vault Root
 
 ```bash
-mcpfs /path/to/dir1 /path/to/dir2
+mcpfs /srv/obsidian/mcp-vault
 ```
+
+Exactly one directory (the vault) is served. Passing more than one directory
+is an error.
+
+Clients see the vault as `/`, so tool paths are short vault-relative paths
+instead of absolute host paths:
+
+| Client path                       | Resolves to                            |
+| --------------------------------- | -------------------------------------- |
+| `/`, `.` or empty string          | vault root                             |
+| `notes/today.md`                  | `<vault>/notes/today.md`               |
+| `/notes/today.md`                 | `<vault>/notes/today.md`               |
+| `/srv/obsidian/mcp-vault/x.md`    | `<vault>/x.md` (legacy absolute paths) |
+| `../other`, symlinks out of vault | rejected                               |
+
+Tool output (search results, diffs, error messages) also uses vault paths
+such as `/notes/today.md`, so the host location of the vault is never exposed.
 
 ### How It Works
 
@@ -389,8 +417,58 @@ mcpfs /path/to/dir1 /path/to/dir2
   - Input: `path` (string)
 
 - **list_allowed_directories**
-  - List all accessible directories
+  - Returns the vault root (`/`)
   - No input required
+
+### Polishing Tools (optional, OpenRouter)
+
+Registered only when `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` are set. Any
+OpenRouter model works, including Google models such as `google/<model>`.
+Set `OPENROUTER_SERVICE_TIER=flex` to use OpenRouter's cheaper, lower-priority
+flex endpoints. Flex requests can fail with capacity errors (for example HTTP 429) instead of falling back to the default tier, and they may be slower, so
+consider raising `POLISH_TIMEOUT_MS`. The MCP
+client decides on its own when to call them, for example when the user asks
+to polish or proofread a note.
+
+- **polish_file**
+  - Copy-edits a vault file with the configured model. The server reads the file itself, so
+    the client does not send the content.
+  - Inputs: `path`, `template` (optional), `instructions` (optional),
+    `dryRun` (default `true`)
+  - `dryRun: true` returns a diff. Calling again with `dryRun: false` and the
+    same arguments writes exactly the previewed result (cached for 30
+    minutes) without another model call. If the file changed in the meantime,
+    nothing is written.
+- **polish_text**
+  - Copy-edits text passed directly and returns the result
+  - Inputs: `text`, `template` (optional), `instructions` (optional)
+- **list_polish_templates**
+  - Lists templates with their descriptions so the client can pick one
+- **save_polish_template**
+  - Inputs: `name`, `description`, `instructions`, `temperature` (optional),
+    `overwrite` (default `false`)
+
+Built-in rules always apply and cannot be overridden by a template: meaning,
+language, Markdown structure, wikilinks and code are preserved, and YAML
+frontmatter is never sent to the model. Long files are split at blank lines
+outside code blocks.
+
+Templates are Markdown notes in `POLISH_TEMPLATE_DIR` and can also be edited
+in Obsidian:
+
+```md
+---
+description: "Blog posts: keep casual tone, short sentences"
+temperature: 0.2
+---
+
+- Keep each sentence under about 40 characters.
+- Prefer active voice.
+```
+
+Tool descriptions instruct clients to write template and instruction prompts
+in English unless the user asks for another language. The polished text
+always keeps its own language.
 
 ### Tool Annotations
 
@@ -409,6 +487,10 @@ mcpfs /path/to/dir1 /path/to/dir2
 | `write_file`                | `false`      | `true`         | `true`          |
 | `edit_file`                 | `false`      | `false`        | `true`          |
 | `move_file`                 | `false`      | `false`        | `false`         |
+| `polish_text`               | `true`       | –              | –               |
+| `list_polish_templates`     | `true`       | –              | –               |
+| `polish_file`               | `false`      | `false`        | `true`          |
+| `save_polish_template`      | `false`      | `true`         | `true`          |
 
 ---
 
