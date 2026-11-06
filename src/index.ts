@@ -1198,27 +1198,6 @@ function createServer() {
     })
   );
 
-  server.registerTool(
-    "list_allowed_directories",
-    {
-      title: "List Allowed Directories",
-      description:
-        "Returns the directory this server can access. The server exposes a single " +
-        "vault whose root is '/'; every file and subdirectory in it is accessible. " +
-        VAULT_PATH_NOTE,
-      inputSchema: {},
-      outputSchema: { content: z.string() },
-      annotations: { readOnlyHint: true },
-    },
-    withVaultErrors(async () => {
-      const text = "Allowed directories:\n/";
-      return {
-        content: [{ type: "text" as const, text }],
-        structuredContent: { content: text },
-      };
-    })
-  );
-
   // MCP Roots are intentionally ignored. The server exposes only the
   // operator-selected vault directory passed at startup.
 

@@ -416,10 +416,6 @@ such as `/notes/today.md`, so the host location of the vault is never exposed.
   - Get detailed file/directory metadata
   - Input: `path` (string)
 
-- **list_allowed_directories**
-  - Returns the vault root (`/`)
-  - No input required
-
 ### Polishing Tools (optional, OpenRouter)
 
 Registered only when `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` are set. Any
@@ -482,7 +478,6 @@ always keeps its own language.
 | `directory_tree`            | `true`       | –              | –               |
 | `search_files`              | `true`       | –              | –               |
 | `get_file_info`             | `true`       | –              | –               |
-| `list_allowed_directories`  | `true`       | –              | –               |
 | `create_directory`          | `false`      | `true`         | `false`         |
 | `write_file`                | `false`      | `true`         | `true`          |
 | `edit_file`                 | `false`      | `false`        | `true`          |
