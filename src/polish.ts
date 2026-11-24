@@ -4,6 +4,7 @@ import { createHash } from "crypto";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { logger } from "./logger.js";
+import { notifyVaultChange } from "./syncthing.js";
 import {
   VAULT_PATH_NOTE,
   createUnifiedDiff,
@@ -599,6 +600,7 @@ export function registerPolishTools(server: McpServer, config: PolishConfig): vo
         throw new Error(`${vaultPath} changed while polishing; nothing was written. Try again.`);
       }
       await writeFileContent(filePath, polished);
+      notifyVaultChange(filePath);
       previewCache.delete(key);
       return textResult(
         `Polished ${vaultPath}${reused ? " (applied the previewed result)" : ""}.\n\n${diff}`
@@ -724,6 +726,7 @@ export function registerPolishTools(server: McpServer, config: PolishConfig): vo
         filePath,
         serializeTemplate(description, args.temperature, args.instructions)
       );
+      notifyVaultChange(filePath);
       return textResult(`${exists ? "Updated" : "Created"} polish template ${vaultPath}.`);
     })
   );

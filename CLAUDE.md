@@ -41,6 +41,7 @@ mcpfs is an HTTP streaming port of the official MCP Filesystem Server. It replac
 - Persistent, hashed OAuth token state with atomic file writes
 - ChatGPT integration via MCP connectors
 - Optional OpenRouter-backed polishing tools with vault-stored style templates
+- Optional Syncthing REST rescans after writes (debounced) and a manual rescan tool
 
 ## Code Principles
 
@@ -95,6 +96,7 @@ mcpfs/
 │   ├── oauth-store.ts    # Persistent hashed OAuth state store
 │   ├── lib.ts            # Filesystem operations, vault path mapping
 │   ├── polish.ts         # Optional OpenRouter polishing tools and templates
+│   ├── syncthing.ts      # Optional Syncthing rescan notifier and tool
 │   ├── path-utils.ts     # Path normalization utilities
 │   ├── roots-utils.ts    # MCP roots handling
 │   └── logger.ts         # Logging utilities
@@ -119,6 +121,11 @@ mcpfs/
 | `OPENROUTER_MODEL`        | With key | -                         | OpenRouter model ID for polishing        |
 | `OPENROUTER_SERVICE_TIER` | No       | -                         | OpenRouter service tier (e.g. `flex`)    |
 | `POLISH_TEMPLATE_DIR`     | No       | `/_polish`                | Vault folder for polish templates        |
+| `SYNCTHING_URL`           | No       | -                         | Syncthing REST base URL; enables rescans |
+| `SYNCTHING_API_KEY`       | With URL | -                         | Syncthing API key                        |
+| `SYNCTHING_FOLDER_ID`     | With URL | -                         | Syncthing folder ID of the vault         |
+| `SYNCTHING_DEBOUNCE_MS`   | No       | 1000                      | Batching delay for automatic rescans     |
+| `SYNCTHING_TIMEOUT_MS`    | No       | 30000                     | Timeout per rescan request               |
 
 ## Git Workflow
 

@@ -13,6 +13,12 @@ services:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}
       OPENROUTER_SERVICE_TIER: ${OPENROUTER_SERVICE_TIER:-}
+      # Optional: rescans the host Syncthing folder after writes
+      SYNCTHING_URL: ${SYNCTHING_URL:-}
+      SYNCTHING_API_KEY: ${SYNCTHING_API_KEY:-}
+      SYNCTHING_FOLDER_ID: ${SYNCTHING_FOLDER_ID:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./mcpfs/oauth:/var/lib/mcpfs:rw
       - ${OBSIDIAN_VAULT_PATH:?Set OBSIDIAN_VAULT_PATH}:/srv/obsidian/vault:rw
