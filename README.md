@@ -23,8 +23,9 @@ This port uses HTTP Streaming, enabling:
 
 This fork keeps the file-based interface and OAuth transport, and is designed
 to expose a directory that is synchronized by an external filesystem tool
-such as Syncthing. mcpfs reads and writes that directory directly; it does not
-call a synchronization API or require a particular synchronization backend.
+such as Syncthing. mcpfs reads and writes that directory directly and does not
+require a particular synchronization backend. Optionally, it can ask a
+Syncthing instance to rescan changed paths right after each write.
 
 ---
 
@@ -40,6 +41,7 @@ call a synchronization API or require a particular synchronization backend.
 - **OAuth 2.1 authentication** with PKCE support
 - **ChatGPT integration** via MCP connectors
 - Works with native Syncthing services and other filesystem synchronizers
+- Optional Syncthing REST rescans after writes for faster propagation
 
 ## Installation
 
@@ -131,8 +133,9 @@ Quick tunnels generate a new URL each time. For a permanent URL:
 The server serves the directory passed on the command line. When using
 Syncthing, this should be the same local directory configured as the
 Syncthing folder on the Linux host. mcpfs treats it as a normal local
-filesystem: Syncthing runs independently and no Syncthing credentials or REST
-endpoint are needed by mcpfs.
+filesystem: Syncthing runs independently and picks up changes with its own
+file watcher. Optionally, mcpfs can call Syncthing's REST API to rescan
+changed paths immediately (see [Syncthing rescans](#syncthing-rescans-optional)).
 
 Client-provided MCP Roots are ignored so the exposed directory cannot be
 expanded by the MCP client. When no directories are specified, the server
@@ -174,6 +177,11 @@ PORT=8080 MCP_AUTH_SECRET=my-owner-secret mcpfs /path/to/dir
 | `POLISH_TEMPERATURE`      | No                | 0.3        | Default sampling temperature for polishing                     |
 | `POLISH_MAX_CHUNK_CHARS`  | No                | 6000       | Approximate characters sent per model request                  |
 | `POLISH_TIMEOUT_MS`       | No                | 120000     | Timeout per model request                                      |
+| `SYNCTHING_URL`           | No                | -          | Syncthing GUI/REST base URL; enables rescans                   |
+| `SYNCTHING_API_KEY`       | With URL          | -          | Syncthing API key (Settings → General → API Key)               |
+| `SYNCTHING_FOLDER_ID`     | With URL          | -          | Folder ID whose root is the served vault                       |
+| `SYNCTHING_DEBOUNCE_MS`   | No                | 1000       | Delay that batches writes into one rescan request              |
+| `SYNCTHING_TIMEOUT_MS`    | No                | 30000      | Timeout per rescan request                                     |
 
 Back up the synchronized directory independently of mcpfs (for example with
 Restic or filesystem snapshots). A backup job must cover changes received by
@@ -239,6 +247,12 @@ services:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}
       OPENROUTER_SERVICE_TIER: ${OPENROUTER_SERVICE_TIER:-}
+      # Optional: rescans the host Syncthing folder after writes
+      SYNCTHING_URL: ${SYNCTHING_URL:-}
+      SYNCTHING_API_KEY: ${SYNCTHING_API_KEY:-}
+      SYNCTHING_FOLDER_ID: ${SYNCTHING_FOLDER_ID:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./mcpfs/oauth:/var/lib/mcpfs:rw
       - ${OBSIDIAN_VAULT_PATH:?Set OBSIDIAN_VAULT_PATH}:/srv/obsidian/vault:rw
@@ -254,6 +268,48 @@ networks:
 The reverse proxy or tunnel should forward to port `24024` and use the same
 origin as `MCP_PUBLIC_URL`. The `MCP_AUTH_SECRET` is used only on the OAuth
 consent page; it is not a Syncthing credential.
+
+### Syncthing rescans (optional)
+
+Syncthing's file watcher already notices writes made through mcpfs, but it
+waits (about 10 seconds by default) before scanning. When `SYNCTHING_URL`,
+`SYNCTHING_API_KEY` and `SYNCTHING_FOLDER_ID` are all set, mcpfs calls
+`POST /rest/db/scan` for the changed paths after `write_file`, `edit_file`,
+`create_directory`, `move_file`, `polish_file` and `save_polish_template`.
+Writes within `SYNCTHING_DEBOUNCE_MS` are batched into one request. A failed
+rescan is only logged; the write itself still succeeds. The
+`syncthing_rescan` tool is also registered for manual rescans.
+
+The Syncthing folder's root must be the same directory that mcpfs serves,
+because vault paths are sent as the folder-relative `sub` parameter.
+
+Syncthing's GUI listens on `127.0.0.1:8384` by default, which the MCPFS
+container cannot reach. To use the `host.docker.internal` mapping from the
+Compose file above:
+
+1. In the Syncthing GUI (Actions → Settings → GUI), set **GUI Listen
+   Address** to `0.0.0.0:8384` and set a GUI username and password, since
+   the GUI is now reachable from the network.
+2. Block port `8384` from outside the host, and allow it only from Docker
+   networks. With UFW, for example (use the subnet shown by
+   `docker network inspect risu_net`):
+
+   ```bash
+   sudo ufw allow from 172.16.0.0/12 to any port 8384 proto tcp
+   ```
+
+3. Copy the API key from Actions → Settings → General, and the folder ID
+   from the folder's edit dialog, and set them in the deployment
+   environment:
+
+   ```bash
+   SYNCTHING_URL=http://host.docker.internal:8384
+   SYNCTHING_API_KEY=<api key>
+   SYNCTHING_FOLDER_ID=<folder id>
+   ```
+
+The API key grants full control over Syncthing; keep it out of the
+repository like `MCP_AUTH_SECRET`.
 
 ---
 
@@ -416,6 +472,10 @@ such as `/notes/today.md`, so the host location of the vault is never exposed.
   - Get detailed file/directory metadata
   - Input: `path` (string)
 
+- **syncthing_rescan** (registered only when Syncthing rescans are configured)
+  - Ask Syncthing to rescan a path immediately
+  - Input: `path` (string, optional; defaults to the whole vault)
+
 ### Polishing Tools (optional, OpenRouter)
 
 Registered only when `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` are set. Any
@@ -482,6 +542,7 @@ always keeps its own language.
 | `write_file`                | `false`      | `true`         | `true`          |
 | `edit_file`                 | `false`      | `false`        | `true`          |
 | `move_file`                 | `false`      | `false`        | `false`         |
+| `syncthing_rescan`          | `false`      | `true`         | `false`         |
 | `polish_text`               | `true`       | –              | –               |
 | `list_polish_templates`     | `true`       | –              | –               |
 | `polish_file`               | `false`      | `false`        | `true`          |

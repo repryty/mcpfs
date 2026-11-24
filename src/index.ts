@@ -33,6 +33,12 @@ import {
   VAULT_PATH_NOTE,
 } from "./lib.js";
 import { loadPolishConfig, registerPolishTools } from "./polish.js";
+import {
+  loadSyncthingConfig,
+  notifyVaultChange,
+  registerSyncthingTools,
+  setSyncthingConfig,
+} from "./syncthing.js";
 
 // Get the directory where this script is located
 const __filename = fileURLToPath(import.meta.url);
@@ -572,6 +578,10 @@ setVaultRoot(vaultRoot);
 // Optional OpenRouter-backed polishing tools (enabled when OPENROUTER_API_KEY is set)
 const polishConfig = loadPolishConfig(process.env);
 
+// Optional Syncthing rescans (enabled when SYNCTHING_URL, _API_KEY and _FOLDER_ID are set)
+const syncthingConfig = loadSyncthingConfig(process.env);
+setSyncthingConfig(syncthingConfig);
+
 // Type definitions for tool arguments (with undefined to satisfy exactOptionalPropertyTypes)
 type ReadTextFileArgs = {
   path: string;
@@ -847,6 +857,7 @@ function createServer() {
     withVaultErrors(async (args: WriteFileArgs) => {
       const validPath = await validatePath(args.path);
       await writeFileContent(validPath, args.content);
+      notifyVaultChange(validPath);
       const text = `Successfully wrote to ${args.path}`;
       return {
         content: [{ type: "text" as const, text }],
@@ -886,6 +897,7 @@ function createServer() {
         };
       }
       const result = await applyFileEdits(validPath, args.edits, false);
+      notifyVaultChange(validPath);
       return {
         content: [{ type: "text" as const, text: result }],
         structuredContent: { content: result },
@@ -912,6 +924,7 @@ function createServer() {
     withVaultErrors(async (args: CreateDirectoryArgs) => {
       const validPath = await validatePath(args.path);
       await fs.mkdir(validPath, { recursive: true });
+      notifyVaultChange(validPath);
       const text = `Successfully created directory ${args.path}`;
       return {
         content: [{ type: "text" as const, text }],
@@ -1130,6 +1143,7 @@ function createServer() {
       const validSourcePath = await validatePath(args.source);
       const validDestPath = await validatePath(args.destination);
       await fs.rename(validSourcePath, validDestPath);
+      notifyVaultChange(validSourcePath, validDestPath);
       const text = `Successfully moved ${args.source} to ${args.destination}`;
       return {
         content: [{ type: "text" as const, text }],
@@ -1203,6 +1217,10 @@ function createServer() {
 
   if (polishConfig) {
     registerPolishTools(server, polishConfig);
+  }
+
+  if (syncthingConfig) {
+    registerSyncthingTools(server, syncthingConfig);
   }
 
   return server;
